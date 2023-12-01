@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import os
 from emteqai.oco.load_data import load_data
 from emteqai.utils.processing.signals.filters import bandpass_filter
 import scipy
@@ -7,6 +8,10 @@ import matplotlib.pyplot as plt
 from emteqai.utils.processing.data import segmentation
 import peakutils
 import warnings
+from scipy.signal import find_peaks as scipy_find_peaks
+
+
+color_dict = {"v": "tab:blue", "p": "tab:red"}
 
 
 def fix_annotations(data, label_columns=None):
@@ -33,7 +38,7 @@ def baseline_drift_filter(signal):
     Remove baseline drift from signal using DC-blocker filter
     Reference: https://ccrma.stanford.edu/~jos/fp/DC_Blocker.html
     """
-    alpha = 0.995  # should be adjusted
+    alpha = 0.999  # should be adjusted
     b = [1, -1]
     a = [1, -alpha]
     return scipy.signal.filtfilt(b, a, signal)
@@ -57,47 +62,55 @@ def get_segments(data, column):
     return res
 
 
-def plot_data(data, col, title, peaks, valleys, threshold):
-    fig, ax = plt.subplots(1, 1, figsize=(20, 6))
+def draw_labels(data, ax):
+    if "Position" in data.columns:
+        ymin, ymax = ax.get_ylim()
+        segments = get_segments(data, "Position")
+        sitting_standing = segments.loc[
+            segments["label"].str.contains("sitting-")
+        ]
+        standing_sitting = segments.loc[
+            segments["label"].str.contains("standing-")
+        ]
+
+        # add lines for sitting to standing transition
+        ax.vlines(sitting_standing["start"], ymin, ymax, colors="b", alpha=0.9)
+        ax.vlines(sitting_standing["end"], ymin, ymax, colors="b", alpha=0.9)
+        # add lines for standing to sitting transition
+        ax.vlines(standing_sitting["start"], ymin, ymax, colors="r", alpha=0.9)
+        ax.vlines(standing_sitting["end"], ymin, ymax, colors="r", alpha=0.9)
+
+
+def plot_data(data, col, title, extremes, threshold, ax):
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=(20, 6))
     ax.plot(data.index, data[col], c="tab:blue")
-    ymin, ymax = ax.get_ylim()
-
-    segments = get_segments(data, "Position")
-    sitting_standing = segments.loc[segments["label"].str.contains("sitting-")]
-    standing_sitting = segments.loc[segments["label"].str.contains("standing-")]
-
-    # add lines for sitting to standing transition
-    ax.vlines(sitting_standing["start"], ymin, ymax, colors="b", alpha=0.3)
-    ax.vlines(sitting_standing["end"], ymin, ymax, colors="b", alpha=0.3)
-    # add lines for standing to sitting transition
-    ax.vlines(standing_sitting["start"], ymin, ymax, colors="r", alpha=0.3)
-    ax.vlines(standing_sitting["end"], ymin, ymax, colors="r", alpha=0.3)
-
+    draw_labels(data, ax)
     # Add the peaks and valleys detected from the signal
-    ax.scatter(peaks, data[col].iloc[peaks], c="g", alpha=0.7)
-    ax.scatter(valleys, data[col].iloc[valleys], c="r", alpha=0.7)
+    for type, extreme in extremes:
+        ax.scatter(
+            extreme, data[col].iloc[extreme], c=color_dict[type], alpha=0.7
+        )
 
     ax.set_xticks(range(0, data.shape[0], 500))
-    # draw horizontal lines that represent the threshold used for peak detector
-    ax.axhline(threshold)
-    ax.axhline(-threshold)
+    if threshold is not None:
+        # draw the threshold used for finding the extremes
+        ax.axhline(threshold)
+        ax.axhline(-threshold)
 
-    plt.title(title)
-    plt.show()
+    ax.set_title(title)
+    return ax
 
 
-def plot_data2(data, col, title, transitions, threshold):
-    fig, ax = plt.subplots(1, 1, figsize=(20, 6))
+def plot_data2(data, col, title, transitions, threshold, ax):
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=(20, 6))
     ax.plot(data.index, data[col], c="tab:blue")
-    ymin, ymax = ax.get_ylim()
 
     for transition in transitions:
         e1 = transition[0]
         e2 = transition[1]
-        if e1[0] == "p":
-            c = "b"
-        else:
-            c = "r"
+        c = color_dict[e1[0]]
         # add lines for sitting to standing transition
         ax.axvspan(e1[1], e2[1], color=c, alpha=0.3)
 
@@ -106,12 +119,39 @@ def plot_data2(data, col, title, transitions, threshold):
         ax.scatter(e2[1], data[col].iloc[e2[1]], c=c, alpha=0.7)
 
     ax.set_xticks(range(0, data.shape[0], 500))
-    # draw horizontal lines that represent the threshold used for peak detector
-    ax.axhline(threshold)
-    ax.axhline(-threshold)
+    if threshold is not None:
+        # draw the threshold used for finding the extremes
+        ax.axhline(threshold)
+        ax.axhline(-threshold)
 
-    plt.title(title)
-    plt.show()
+    ax.set_title(title)
+    return ax
+
+
+def plot_data_ODR(data, col, title, extremes, threshold=None, ax=None):
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=(20, 6))
+    ax.plot(data.index, data[col], c="tab:blue")
+    draw_labels(data, ax)
+
+    for type, extreme in extremes:
+        # Add the peaks and valleys detected from the signal
+        ax.scatter(
+            extreme, data[col].iloc[extreme], c=color_dict[type], alpha=0.7
+        )
+        # highlight the transitions
+        ax.axvspan(
+            extreme - 25, extreme + 25, color=color_dict[type], alpha=0.3
+        )
+
+    ax.set_xticks(range(0, data.shape[0], 500))
+    if threshold is not None:
+        # draw the threshold used for finding the extremes
+        ax.axhline(threshold)
+        ax.axhline(-threshold)
+
+    ax.set_title(title)
+    return ax
 
 
 def find_peaks(signal):
@@ -120,6 +160,14 @@ def find_peaks(signal):
     valleys = peakutils.indexes(
         signal * -1, threshold, min_dist=50, thres_abs=True
     )
+
+    return peaks, valleys, threshold
+
+
+def find_peaks_ODR(signal):
+    threshold = np.nanstd(signal) * 1.5
+    peaks, _ = scipy_find_peaks(signal, threshold, width=50)
+    valleys, _ = scipy_find_peaks(signal * -1, threshold, width=50)
 
     return peaks, valleys, threshold
 
@@ -150,6 +198,26 @@ def filter_transition_extremes(extremes):
     # detected or if the middle exterme was just an error
 
     filtered_extremes.append(extremes[-1])
+
+    return filtered_extremes
+
+
+def filter_transition_extremes_ODR(extremes):
+    # create an empty list which will be filled with the filtered extremes
+    filtered_extremes = []
+    # The first and last extreme cant be filtered since they have 1 neighbour
+    filtered_extremes.append(extremes[0])
+
+    # We should not expect there to be three extremes of same kind in a sequence
+    for extreme1, extreme2 in zip(extremes[:-1], extremes[1:]):
+        if extreme1[0] == extreme2[0]:
+            warnings.warn(
+                "There are multiple consecutive peaks, or valleys."
+                + " They will be processed and removed"
+            )
+        else:
+            # Add the extreme (peak or valley) if they conform to the scheme
+            filtered_extremes.append(extreme2)
 
     return filtered_extremes
 
@@ -243,51 +311,25 @@ def get_neighbouring_distances(neighbours):
     return transition_extremes
 
 
-def detect_transition(peaks, valleys, max_neighbor_dist):
-    transition_sequence = [("p", x) for x in peaks]
-    transition_sequence.extend([("v", x) for x in valleys])
-    transition_sequence.sort(key=lambda x: x[1])
+def pair_extremes(peaks, valleys):
+    sequence = [("p", x) for x in peaks]
+    sequence.extend([("v", x) for x in valleys])
+    sequence.sort(key=lambda x: x[1])
 
-    # if len(peaks) == 1 and valleys == 1:
-    #     return
-    # for x in range(len(transition_sequence) - 2):
-    #     x
-
-    # closest_neighbour = [
-    #     y[1] - x[1]
-    #     for y, x in zip(transition_sequence[1:], transition_sequence[:-1])
-    # ]
-
-    # # check left and right, see which one is closer and say that that one is the logical predecesor and succesor to the specific peak
-    # # and then by cheking if its valley-peak or peak-valley determine the transition
-
-    # closest_neighbour
-
-    return transition_sequence
+    return sequence
 
 
-if __name__ == "__main__":
-    path = "./data/fast_repetitions.txt"
+def pipeline(path, sensor_col="Pressure/Raw"):
     data, _ = load_data(path)
     data = fix_annotations(data, ["Position", "Speed", "Activity"])
-
-    # data['Pressure/Raw'].rolling(25).mean()[::20].diff().plot()
-    # data['Pressure/Raw'].plot()
-    # sig = scipy.signal.medfilt(np.array(data['Pressure/Raw']), 175)
-
-    sig = bandpass_filter(np.array(data["Pressure/Raw"]), 4, [0.05, 0.5], 50)
+    # create axes for the plot
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, figsize=(20, 19))
+    data[sensor_col].plot(title="Raw", ax=ax1)
+    sig = bandpass_filter(np.array(data[sensor_col]), 4, [0.05, 0.5], 50)
     data["sig"] = scipy.signal.medfilt(sig, 99)
 
-    # pd.DataFrame(sig).plot(figsize=(20, 8))
-    # pd.DataFrame(sig).rolling(25).std().plot(figsize=(20, 8))
-    # pd.DataFrame(sig).rolling(10).sum().diff().plot(figsize=(20, 8))
-    # pd.DataFrame(sig).rolling(50).sum().plot(figsize=(20, 8))
-    # # data['Pressure/Raw'].diff().plot()
-
     peaks, valleys, threshold = find_peaks(data["sig"])
-    transition_sequence = detect_transition(
-        peaks, valleys, max_neighbor_dist=None
-    )
+    transition_sequence = pair_extremes(peaks, valleys)
     filtered_transition_sequence = filter_transition_extremes(
         transition_sequence
     )
@@ -296,5 +338,67 @@ if __name__ == "__main__":
         filtered_transition_sequence
     )
 
-    plot_data(data, "sig", path, peaks, valleys, threshold)
-    plot_data2(data, "sig", path, transition_extremes, threshold)
+    plot_data(data, "sig", path, filtered_transition_sequence, threshold, ax2)
+    plot_data2(data, "sig", path, transition_extremes, threshold, ax3)
+    plt.tight_layout()
+
+    return data
+
+
+def read_data(path):
+    if path[-3:] == "csv":
+        sensor_col = "Pressure"
+        data = pd.read_csv(path)
+        data[sensor_col] = data[sensor_col] * 0.0128
+    elif path[-3:] == "txt":
+        sensor_col = "Pressure/Raw"
+        data, _ = load_data(path)
+        data = fix_annotations(data, ["Position", "Speed", "Activity"])
+
+    return data, sensor_col
+
+
+def pipeline_ODR(path, sensor_col="Pressure"):
+    data, sensor_col = read_data(path)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True, figsize=(20, 19))
+    # plot the raw pressure data
+    data[sensor_col].plot(title="Raw", ax=ax1)
+
+    # plot the medfilt, smooth processed signal
+    medfilt = scipy.signal.medfilt(np.array(data[sensor_col]), 99)
+    pd.DataFrame(medfilt).rolling(50).sum().plot(
+        title="medfilt + 50 sum", ax=ax2
+    )
+
+    # process signal
+    data["sig"] = bandpass_filter(
+        data[sensor_col], order=2, fcritical=[0.001, 0.2], fs=50
+    )
+    data["sig"] = data["sig"].diff()
+
+    peaks, valleys, threshold = find_peaks_ODR(data["sig"])
+    extremes = pair_extremes(peaks, valleys)
+    extremes = filter_transition_extremes_ODR(extremes)
+
+    plot_data_ODR(data, "sig", f, extremes, None, ax=ax3)
+    plt.tight_layout()
+    plt.show()
+
+    return data
+
+
+if __name__ == "__main__":
+    path = "./data/ODR.csv"
+    pressure_col = "Pressure/Raw"
+
+    # data = pipeline("./data/upstairs.txt")
+
+    datasets = {}
+    odr_datasets = {}
+    for f in os.listdir(r"./data"):
+        odr_datasets[f] = pipeline_ODR(os.path.join("./data", f))
+
+        # if "ODR" in f:
+        #     odr_datasets[f] = pipeline_ODR(os.path.join("./data", f))
+        # else:
+        #     datasets[f] = pipeline(os.path.join("./data", f))
